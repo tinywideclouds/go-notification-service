@@ -1,0 +1,17 @@
+# Configuration for the Notification Service.
+# These values are embedded in the application binary at build time.
+# Secrets (e.g., vendor API keys) must be provided via environment variables.
+
+project_id: gemini-power-test
+
+# The address for the internal HTTP server (health checks, metrics, etc.).
+listen_addr: ":8083"
+
+# The Pub/Sub subscription the service will pull notification requests from.
+subscription_id: "push-notifications-sub"
+
+# The topic where persistently failing messages will be sent.
+subscription_dlq_topic_id: "push-notifications-dlq"
+
+# The number of concurrent workers processing messages.
+num_pipeline_workers: 5
