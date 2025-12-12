@@ -60,11 +60,7 @@ func New(
 	// Register Routes
 	mux := baseServer.Mux()
 
-	// Add CORS (Simple default for now, can be config driven if needed like routing service)
-	corsMiddleware := middleware.NewCorsMiddleware(middleware.CorsConfig{
-		AllowedOrigins: []string{"*"}, // TODO: Tighten this up later
-		Role:           middleware.CorsRoleDefault,
-	}, logger)
+	corsMiddleware := middleware.NewCorsMiddleware(cfg.CorsConfig, logger)
 
 	// OPTIONS
 	mux.Handle("OPTIONS /tokens", corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})))

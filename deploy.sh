@@ -7,4 +7,5 @@ gcloud run deploy notification-service \
   --set-env-vars="IDENTITY_SERVICE_URL=https://node-identity-service-885150127230.europe-west1.run.app" \
   --set-env-vars="GOOGLE_APPLICATION_CREDENTIALS=/secrets/service-account.json" \
   --set-env-vars="LOG_LEVEL=info" \
+  --set-env-vars="CORS_ALLOWED_ORIGINS=https://messenger-app-885150127230.europe-west1.run.app" \
   --set-secrets="/secrets/service-account.json=fcm-service-account:latest"

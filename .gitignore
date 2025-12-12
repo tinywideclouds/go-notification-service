@@ -31,4 +31,6 @@ go.work.sum
 .idea/
 .vscode/
 
+*__debug*.exe*
+
 service-account.json

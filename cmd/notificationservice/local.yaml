@@ -1,7 +1,7 @@
 # Local development configuration for the go-notification-service
 
 project_id: "gemini-power-test"
-listen_addr: ":8083"
+listen_addr: ":8086"
 
 cors:
   allowed_origins:

@@ -25,15 +25,34 @@ import (
 var configFile []byte
 
 func main() {
-	// ... (Logging setup same as before) ...
-	logLevel := slog.LevelInfo // Simplified for brevity
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
+	var logLevel slog.Level
+	switch os.Getenv("LOG_LEVEL") {
+	case "debug", "DEBUG":
+		logLevel = slog.LevelDebug
+	case "info", "INFO":
+		logLevel = slog.LevelInfo
+	case "warn", "WARN":
+		logLevel = slog.LevelWarn
+	case "error", "ERROR":
+		logLevel = slog.LevelError
+	default:
+		logLevel = slog.LevelInfo
+	}
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: logLevel,
+	})).With("service", "go-notifications-service")
+
 	slog.SetDefault(logger)
+
 	ctx := context.Background()
 
-	// ... (Config loading same as before) ...
 	var yamlCfg config.YamlConfig
-	yaml.Unmarshal(configFile, &yamlCfg)
+	err := yaml.Unmarshal(configFile, &yamlCfg)
+	if err != nil {
+		logger.Error("Failed to unmarshal embedded yaml config", "err", err)
+		os.Exit(1)
+	}
+
 	baseCfg, _ := config.NewConfigFromYaml(&yamlCfg, logger)
 	cfg, err := config.UpdateConfigWithEnvOverrides(baseCfg, logger)
 	if err != nil {
