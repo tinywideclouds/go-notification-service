@@ -1,50 +1,77 @@
-// Package service contains the logic for assembling the core application pipeline.
+// --- File: notificationservice/service.go ---
 package notificationservice
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"net/http"
+
+	"github.com/rs/zerolog"
 
 	"github.com/illmade-knight/go-dataflow/pkg/messagepipeline"
-	"github.com/illmade-knight/go-microservice-base/pkg/microservice"
-	"github.com/illmade-knight/go-notification-service/internal/pipeline"
-	"github.com/illmade-knight/go-notification-service/pkg/notification"
-	"github.com/illmade-knight/go-secure-messaging/pkg/transport"
-	"github.com/rs/zerolog"
+	"github.com/tinywideclouds/go-microservice-base/pkg/microservice"
+	"github.com/tinywideclouds/go-microservice-base/pkg/middleware"
+	"github.com/tinywideclouds/go-notification-service/internal/api"
+	"github.com/tinywideclouds/go-notification-service/internal/pipeline"
+	"github.com/tinywideclouds/go-notification-service/notificationservice/config"
+	"github.com/tinywideclouds/go-notification-service/pkg/dispatch"
+	"github.com/tinywideclouds/go-platform/pkg/notification/v1"
 )
 
-// Wrapper now embeds BaseServer to get standard server functionality.
 type Wrapper struct {
 	*microservice.BaseServer
-	pipelineService *messagepipeline.StreamingService[transport.NotificationRequest]
-	logger          zerolog.Logger
+	pipelineService *messagepipeline.StreamingService[notification.NotificationRequest]
+	logger          *slog.Logger
 }
 
-// New assembles and wires up the entire notification service.
+// New assembles the service.
+// REFACTORED: Accepts TokenStore and Auth Middleware.
 func New(
-	listenAddr string,
-	numWorkers int,
+	cfg *config.Config,
 	consumer messagepipeline.MessageConsumer,
-	dispatchers map[string]notification.Dispatcher,
-	logger zerolog.Logger,
+	dispatchers map[string]dispatch.Dispatcher,
+	tokenStore dispatch.TokenStore, // <-- ADDED
+	authMiddleware func(http.Handler) http.Handler, // <-- ADDED
+	logger *slog.Logger,
 ) (*Wrapper, error) {
-	// 1. Create the standard base server.
-	baseServer := microservice.NewBaseServer(logger, listenAddr)
 
-	// 2. Create the message handler (the processor).
-	processor := pipeline.NewProcessor(dispatchers, logger)
+	// 1. Base Server
+	baseServer := microservice.NewBaseServer(logger, cfg.ListenAddr)
 
-	// 3. Assemble the core processing pipeline.
-	streamingService, err := messagepipeline.NewStreamingService[transport.NotificationRequest](
-		messagepipeline.StreamingServiceConfig{NumWorkers: numWorkers},
+	// 2. Processor (Now gets the TokenStore)
+	processor := pipeline.NewProcessor(dispatchers, tokenStore, logger)
+
+	// 3. Pipeline
+	streamingService, err := messagepipeline.NewStreamingService[notification.NotificationRequest](
+		messagepipeline.StreamingServiceConfig{NumWorkers: cfg.NumPipelineWorkers},
 		consumer,
 		pipeline.NotificationRequestTransformer,
 		processor,
-		logger,
+		zerolog.Nop(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create streaming service: %w", err)
 	}
+
+	// 4. API (Token Registration)
+	tokenAPI := api.NewTokenAPI(tokenStore, logger)
+
+	// Register Routes
+	mux := baseServer.Mux()
+
+	// Add CORS (Simple default for now, can be config driven if needed like routing service)
+	corsMiddleware := middleware.NewCorsMiddleware(middleware.CorsConfig{
+		AllowedOrigins: []string{"*"}, // TODO: Tighten this up later
+		Role:           middleware.CorsRoleDefault,
+	}, logger)
+
+	// OPTIONS
+	mux.Handle("OPTIONS /tokens", corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})))
+
+	// PUT /tokens (Protected)
+	registerHandler := http.HandlerFunc(tokenAPI.RegisterTokenHandler)
+	mux.Handle("PUT /tokens", corsMiddleware(authMiddleware(registerHandler)))
 
 	return &Wrapper{
 		BaseServer:      baseServer,
@@ -53,35 +80,28 @@ func New(
 	}, nil
 }
 
-// Start runs the service's background pipeline before starting the base HTTP server.
+// Start and Shutdown remain unchanged
 func (w *Wrapper) Start(ctx context.Context) error {
-	w.logger.Info().Msg("Core processing pipeline starting...")
+	w.logger.Info("Core processing pipeline starting...")
 	if err := w.pipelineService.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start processing service: %w", err)
 	}
-
-	// Once the pipeline is running, the service is ready to be exposed.
 	w.SetReady(true)
-	w.logger.Info().Msg("Service is now ready.")
-
+	w.logger.Info("Service is now ready.")
 	return w.BaseServer.Start()
 }
 
-// Shutdown gracefully stops all service components in the correct order.
 func (w *Wrapper) Shutdown(ctx context.Context) error {
-	w.logger.Info().Msg("Shutting down service components...")
+	w.logger.Info("Shutting down service components...")
 	var finalErr error
-
 	if err := w.pipelineService.Stop(ctx); err != nil {
-		w.logger.Error().Err(err).Msg("Processing pipeline shutdown failed.")
+		w.logger.Error("Processing pipeline shutdown failed.", "err", err)
 		finalErr = err
 	}
-
 	if err := w.BaseServer.Shutdown(ctx); err != nil {
-		w.logger.Error().Err(err).Msg("HTTP server shutdown failed.")
+		w.logger.Error("HTTP server shutdown failed.", "err", err)
 		finalErr = err
 	}
-
-	w.logger.Info().Msg("Service shutdown complete.")
+	w.logger.Info("Service shutdown complete.")
 	return finalErr
 }

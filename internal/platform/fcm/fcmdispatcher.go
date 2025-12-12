@@ -1,24 +1,25 @@
+// --- File: internal/platform/fcm/fcmdispatcher.go ---
 // Package fcm will contain the client for Firebase Cloud Messaging.
 package fcm
 
 import (
 	"context"
+	"log/slog"
 
-	"github.com/illmade-knight/go-notification-service/pkg/notification"
-	"github.com/illmade-knight/go-secure-messaging/pkg/transport"
-	"github.com/rs/zerolog"
+	"github.com/tinywideclouds/go-notification-service/pkg/dispatch"
+	"github.com/tinywideclouds/go-platform/pkg/notification/v1"
 )
 
 // LoggingDispatcher is a placeholder implementation of the notification.Dispatcher interface.
 // It logs the notification details instead of sending them to a real service.
 type LoggingDispatcher struct {
-	logger zerolog.Logger
+	logger *slog.Logger
 }
 
 // NewLoggingDispatcher creates a new logging-only dispatcher.
-func NewLoggingDispatcher(logger zerolog.Logger) (notification.Dispatcher, error) {
+func NewLoggingDispatcher(logger *slog.Logger) (dispatch.Dispatcher, error) {
 	dispatcher := &LoggingDispatcher{
-		logger: logger.With().Str("component", "FCMDispatcher").Logger(),
+		logger: logger.With("component", "FCMDispatcher"),
 	}
 	return dispatcher, nil
 }
@@ -27,15 +28,15 @@ func NewLoggingDispatcher(logger zerolog.Logger) (notification.Dispatcher, error
 func (d *LoggingDispatcher) Dispatch(
 	ctx context.Context,
 	tokens []string,
-	content transport.NotificationContent,
+	content notification.NotificationContent,
 	data map[string]string,
 ) error {
-	d.logger.Info().
-		Int("token_count", len(tokens)).
-		Str("title", content.Title).
-		Str("body", content.Body).
-		Interface("data", data).
-		Msg("Dispatching notification.")
+	d.logger.Info("Dispatching notification.",
+		"token_count", len(tokens),
+		"title", content.Title,
+		"body", content.Body,
+		"data", data,
+	)
 
 	// In a real implementation, this is where the call to the FCM service would be.
 	// For the MVP, we just return nil to simulate a successful dispatch.

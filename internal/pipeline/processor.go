@@ -1,54 +1,65 @@
-// Package pipeline contains the core message processing components for the service.
+// --- File: internal/pipeline/processor.go ---
 package pipeline
 
 import (
 	"context"
+	"log/slog"
 
 	"github.com/illmade-knight/go-dataflow/pkg/messagepipeline"
-	"github.com/illmade-knight/go-notification-service/pkg/notification"
-	"github.com/illmade-knight/go-secure-messaging/pkg/transport"
-	"github.com/rs/zerolog"
+	"github.com/tinywideclouds/go-notification-service/pkg/dispatch"
+	"github.com/tinywideclouds/go-platform/pkg/notification/v1"
 )
 
-// NewProcessor is a constructor that creates the main message handler.
-// It takes a map of dispatchers, allowing it to route notifications to the correct
-// platform-specific client (e.g., APNS, FCM).
+// NewProcessor creates the main message handler.
+// REFACTORED: Now accepts TokenStore to look up recipients.
 func NewProcessor(
-	dispatchers map[string]notification.Dispatcher,
-	logger zerolog.Logger,
-) messagepipeline.StreamProcessor[transport.NotificationRequest] {
+	dispatchers map[string]dispatch.Dispatcher,
+	tokenStore dispatch.TokenStore, // <-- ADDED
+	logger *slog.Logger,
+) messagepipeline.StreamProcessor[notification.NotificationRequest] {
 
-	// The returned function is the StreamProcessor that will be executed by the pipeline.
-	return func(ctx context.Context, original messagepipeline.Message, request *transport.NotificationRequest) error {
-		procLogger := logger.With().
-			Str("recipient_id", request.RecipientID.String()).
-			Str("pubsub_msg_id", original.ID).
-			Logger()
+	return func(ctx context.Context, original messagepipeline.Message, request *notification.NotificationRequest) error {
+		procLogger := logger.With(
+			"recipient_id", request.RecipientID.String(),
+			"pubsub_msg_id", original.ID,
+		)
 
-		// 1. Group tokens by their platform.
+		// 1. Fetch Tokens (The new responsibility)
+		// The request coming from Routing Service NO LONGER has tokens.
+		// We must find them.
+		tokens, err := tokenStore.GetTokens(ctx, request.RecipientID)
+		if err != nil {
+			procLogger.Error("Failed to fetch device tokens", "err", err)
+			return err // Retryable error
+		}
+
+		if len(tokens) == 0 {
+			procLogger.Info("No devices registered for user; dropping notification.")
+			return nil
+		}
+
+		// 2. Group tokens by platform (Logic preserved)
 		tokensByPlatform := make(map[string][]string)
-		for _, token := range request.Tokens {
+		for _, token := range tokens {
 			tokensByPlatform[token.Platform] = append(tokensByPlatform[token.Platform], token.Token)
 		}
 
-		// 2. For each platform, find the correct dispatcher and send the notification.
-		for platform, tokens := range tokensByPlatform {
+		// 3. Dispatch
+		for platform, platformTokens := range tokensByPlatform {
 			dispatcher, ok := dispatchers[platform]
 			if !ok {
-				procLogger.Warn().Str("platform", platform).Msg("No dispatcher configured for platform; skipping.")
+				procLogger.Warn("No dispatcher configured for platform", "platform", platform)
 				continue
 			}
 
-			procLogger.Info().Str("platform", platform).Int("token_count", len(tokens)).Msg("Dispatching notification.")
-			err := dispatcher.Dispatch(ctx, tokens, request.Content, request.DataPayload)
+			procLogger.Info("Dispatching notification", "platform", platform, "count", len(platformTokens))
+			err := dispatcher.Dispatch(ctx, platformTokens, request.Content, request.DataPayload)
 			if err != nil {
-				// If any dispatch fails, we return the error immediately.
-				// The entire Pub/Sub message will be Nacked and retried.
-				procLogger.Error().Err(err).Str("platform", platform).Msg("Dispatcher failed.")
+				procLogger.Error("Dispatcher failed", "err", err, "platform", platform)
 				return err
 			}
 		}
 
-		return nil // Success
+		return nil
 	}
 }
