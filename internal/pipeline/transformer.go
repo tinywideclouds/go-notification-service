@@ -20,6 +20,14 @@ func NotificationRequestTransformer(
 	_ context.Context,
 	msg *messagepipeline.Message,
 ) (*notification.NotificationRequest, bool, error) {
+
+	var msgData messagepipeline.MessageData
+	if err := json.Unmarshal(msg.Payload, &msgData); err != nil {
+		// If any step fails (malformed JSON, invalid URN, etc.), we return an error
+		// and set skip=true so the StreamingService can handle the Nack/DLQ logic.
+		return nil, true, fmt.Errorf("failed to unmarshal notification request from message %s: %w", msg.ID, err)
+	}
+
 	var nativeReq notification.NotificationRequest
 
 	// This single call performs:
@@ -27,10 +35,14 @@ func NotificationRequestTransformer(
 	// 2. Protobuf Unmarshalling (internal)
 	// 3. Native Type Conversion (internal)
 	// 4. Validation (e.g. URN parsing) (internal)
-	if err := json.Unmarshal(msg.Payload, &nativeReq); err != nil {
+	if err := json.Unmarshal(msgData.Payload, &nativeReq); err != nil {
 		// If any step fails (malformed JSON, invalid URN, etc.), we return an error
 		// and set skip=true so the StreamingService can handle the Nack/DLQ logic.
 		return nil, true, fmt.Errorf("failed to unmarshal notification request from message %s: %w", msg.ID, err)
+	}
+
+	if nativeReq.RecipientID.IsZero() {
+		return nil, true, fmt.Errorf("notification request in message %s is missing RecipientID", msg.ID)
 	}
 
 	// On success, we pass the structured request to the next stage.

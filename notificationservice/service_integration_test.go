@@ -21,11 +21,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/illmade-knight/go-dataflow/pkg/messagepipeline"
 	"github.com/illmade-knight/go-test/emulators"
-	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tinywideclouds/go-notification-service/notificationservice"
-	"github.com/tinywideclouds/go-notification-service/pkg/dispatch"
 	"github.com/tinywideclouds/go-platform/pkg/net/v1"
 	"github.com/tinywideclouds/go-platform/pkg/notification/v1"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -34,9 +32,9 @@ import (
 	"github.com/tinywideclouds/go-notification-service/notificationservice/config"
 )
 
-// ... (MockDispatcher, newTestSlog, createPubsubResources helper - Same as before) ...
-// Assuming they are present or imported from a common test helper file.
-// RE-INCLUDING ESSENTIAL MOCK FOR CONTEXT
+// --- MOCKS ---
+
+// Mock for FCM (Strings)
 type mockDispatcher struct {
 	mu          sync.Mutex
 	callCount   int
@@ -47,15 +45,15 @@ type mockDispatcher struct {
 func newMockDispatcher(failOnCount int) *mockDispatcher {
 	return &mockDispatcher{failOnCount: failOnCount}
 }
-func (m *mockDispatcher) Dispatch(ctx context.Context, tokens []string, content notification.NotificationContent, data map[string]string) error {
+func (m *mockDispatcher) Dispatch(ctx context.Context, tokens []string, content notification.NotificationContent, data map[string]string) (string, []string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.callCount++
 	m.lastTokens = tokens
 	if m.failOnCount > 0 && m.callCount == m.failOnCount {
-		return errors.New("fail")
+		return "", nil, errors.New("fail")
 	}
-	return nil
+	return "123-343-success", nil, nil
 }
 func (m *mockDispatcher) GetCallCount() int {
 	m.mu.Lock()
@@ -68,15 +66,25 @@ func (m *mockDispatcher) GetLastTokens() []string {
 	return m.lastTokens
 }
 
-// END MOCK
+// Mock for Web (Objects) - Required by New()
+type mockWebDispatcher struct {
+	mu sync.Mutex
+}
+
+func (m *mockWebDispatcher) Dispatch(ctx context.Context, subs []notification.WebPushSubscription, content notification.NotificationContent, data map[string]string) (string, []notification.WebPushSubscription, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// No-op for this test, but must exist
+	return "web-success", nil, nil
+}
+
+// --- TEST ---
 
 func TestNotificationService_Integration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
 
-	// Loggers
-	legacyLogger := zerolog.New(zerolog.NewTestWriter(t))
-	slogLogger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	projectID := "test-project-integ"
 
 	// 1. Emulators
@@ -90,8 +98,8 @@ func TestNotificationService_Integration(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { fsClient.Close() })
 
-	// 2. Token Store
-	tokenStore := fsStore.NewTokenStore(fsClient, "device-tokens", slogLogger)
+	// 2. Token Store (Firestore Implementation)
+	tokenStore := fsStore.NewFirestoreStore(fsClient)
 
 	t.Run("Full Lifecycle: Register -> Process -> Dispatch", func(t *testing.T) {
 		// Arrange
@@ -100,19 +108,20 @@ func TestNotificationService_Integration(t *testing.T) {
 		createPubsubResources(t, ctx, psClient, projectID, topicID, subID)
 
 		fcmDispatcher := newMockDispatcher(-1)
-		dispatchers := map[string]dispatch.Dispatcher{"android": fcmDispatcher}
+		webDispatcher := &mockWebDispatcher{}
 
 		consumerCfg := *messagepipeline.NewGooglePubsubConsumerDefaults(subID)
-		consumer, _ := messagepipeline.NewGooglePubsubConsumer(&consumerCfg, psClient, legacyLogger)
+		consumer, _ := messagepipeline.NewGooglePubsubConsumer(&consumerCfg, psClient, logger)
 
-		// Create Service (Using new signature with TokenStore)
+		// Create Service (Using updated signature)
 		svc, err := notificationservice.New(
 			&config.Config{ListenAddr: ":0", NumPipelineWorkers: 2}, // Mock Config
 			consumer,
-			dispatchers,
+			fcmDispatcher, // Explicit FCM
+			webDispatcher, // Explicit Web
 			tokenStore,
-			func(h http.Handler) http.Handler { return h }, // No-op Auth for this test
-			slogLogger,
+			func(h http.Handler) http.Handler { return h }, // No-op Auth
+			logger,
 		)
 		require.NoError(t, err)
 
@@ -122,25 +131,22 @@ func TestNotificationService_Integration(t *testing.T) {
 		go func() { svc.Start(svcCtx) }()
 		t.Cleanup(func() { svc.Shutdown(context.Background()) })
 
-		// Step A: Register Token (Simulate API or direct DB write)
+		// Step A: Register Token (Using new RegisterFCM method)
 		userURN, _ := urn.Parse("urn:sm:user:integ-user")
-		err = tokenStore.RegisterToken(ctx, userURN, notification.DeviceToken{
-			Token: "android-token-999", Platform: "android",
-		})
+		err = tokenStore.RegisterFCM(ctx, userURN, "android-token-999")
 		require.NoError(t, err)
 
 		// Step B: Publish Message (WITHOUT TOKENS)
-		// This simulates the Routing Service sending a "Notify User X" command.
+		// The service will fetch the "android-token-999" from Firestore
 		req := &notification.NotificationRequest{
 			RecipientID: userURN,
 			Content:     notification.NotificationContent{Title: "Hello"},
-			// Tokens: nil/empty
 		}
 		payload, _ := json.Marshal(req)
 
 		psClient.Publisher(topicID).Publish(ctx, &pubsub.Message{Data: payload}).Get(ctx)
 
-		// Assert: Dispatcher called with the token we registered in Step A
+		// Assert: FCM Dispatcher called with the token we registered in Step A
 		require.Eventually(t, func() bool {
 			return fcmDispatcher.GetCallCount() == 1
 		}, 10*time.Second, 100*time.Millisecond)
@@ -149,8 +155,7 @@ func TestNotificationService_Integration(t *testing.T) {
 	})
 }
 
-// ... (Other test helpers) ...
-
+// ... (createPubsubResources helper remains unchanged) ...
 func createPubsubResources(t *testing.T, ctx context.Context, client *pubsub.Client, projectID, topicID, subID string) {
 	t.Helper()
 	topicName := fmt.Sprintf("projects/%s/topics/%s", projectID, topicID)

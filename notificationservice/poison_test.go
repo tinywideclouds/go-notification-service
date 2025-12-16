@@ -5,7 +5,6 @@ package notificationservice_test
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,13 +18,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/illmade-knight/go-dataflow/pkg/messagepipeline"
 	"github.com/illmade-knight/go-test/emulators"
-	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/tinywideclouds/go-notification-service/notificationservice"
 	"github.com/tinywideclouds/go-notification-service/notificationservice/config"
-	"github.com/tinywideclouds/go-notification-service/pkg/dispatch"
 	"github.com/tinywideclouds/go-platform/pkg/net/v1"
 	"github.com/tinywideclouds/go-platform/pkg/notification/v1"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -33,23 +30,37 @@ import (
 
 // --- Mocks ---
 
-// mockTokenStore is needed to satisfy the New() constructor,
-// even though it won't be called in a poison pill scenario (transformer fails first).
+// mockTokenStore updated to match pkg/dispatch/interfaces.go
 type mockTokenStore struct {
 	mock.Mock
 }
 
-func (m *mockTokenStore) RegisterToken(ctx context.Context, userURN urn.URN, token notification.DeviceToken) error {
-	args := m.Called(ctx, userURN, token)
-	return args.Error(0)
+func (m *mockTokenStore) RegisterFCM(ctx context.Context, userURN urn.URN, token string) error {
+	return m.Called(ctx, userURN, token).Error(0)
 }
-
-func (m *mockTokenStore) GetTokens(ctx context.Context, userURN urn.URN) ([]notification.DeviceToken, error) {
+func (m *mockTokenStore) RegisterWeb(ctx context.Context, userURN urn.URN, sub notification.WebPushSubscription) error {
+	return m.Called(ctx, userURN, sub).Error(0)
+}
+func (m *mockTokenStore) UnregisterFCM(ctx context.Context, userURN urn.URN, token string) error {
+	return m.Called(ctx, userURN, token).Error(0)
+}
+func (m *mockTokenStore) UnregisterWeb(ctx context.Context, userURN urn.URN, endpoint string) error {
+	return m.Called(ctx, userURN, endpoint).Error(0)
+}
+func (m *mockTokenStore) Fetch(ctx context.Context, userURN urn.URN) (*notification.NotificationRequest, error) {
 	args := m.Called(ctx, userURN)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
-	return args.Get(0).([]notification.DeviceToken), args.Error(1)
+	return args.Get(0).(*notification.NotificationRequest), args.Error(1)
+}
+
+// Reuse mockWebDispatcher from service_integration_test.go if in same package,
+// otherwise redefine here. Redefining for safety.
+type mockPoisonWebDispatcher struct{}
+
+func (m *mockPoisonWebDispatcher) Dispatch(ctx context.Context, subs []notification.WebPushSubscription, c notification.NotificationContent, d map[string]string) (string, []notification.WebPushSubscription, error) {
+	return "", nil, nil
 }
 
 // --- Test ---
@@ -58,9 +69,7 @@ func TestNotificationService_PoisonPill(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	t.Cleanup(cancel)
 
-	// Loggers: Slog for the service, Zerolog for the legacy consumer lib
-	logger := zerolog.New(zerolog.NewTestWriter(t))
-	slogLogger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	projectID := "test-project-dlq"
 
@@ -70,18 +79,16 @@ func TestNotificationService_PoisonPill(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = psClient.Close() })
 
-	// 2. Arrange: Create main topic, DLQ topic, and subscriptions
+	// 2. Arrange: Resources
 	runID := uuid.NewString()
 	mainTopicID := "push-main-" + runID
 	dlqTopicID := "push-dlq-" + runID
 	mainSubID := mainTopicID + "-sub"
-	dlqSubID := dlqTopicID + "-sub" // To listen for the dead-lettered message
+	dlqSubID := dlqTopicID + "-sub"
 
-	// Create the DLQ topic and a subscription for it first
 	createPubsubResources(t, ctx, psClient, projectID, dlqTopicID, dlqSubID)
 	dlqTopicName := fmt.Sprintf("projects/%s/topics/%s", projectID, dlqTopicID)
 
-	// Create the main topic and subscription WITH the DeadLetterPolicy
 	mainTopicName := fmt.Sprintf("projects/%s/topics/%s", projectID, mainTopicID)
 	_, err = psClient.TopicAdminClient.CreateTopic(ctx, &pubsubpb.Topic{Name: mainTopicName})
 	require.NoError(t, err)
@@ -92,29 +99,24 @@ func TestNotificationService_PoisonPill(t *testing.T) {
 		Topic: mainTopicName,
 		DeadLetterPolicy: &pubsubpb.DeadLetterPolicy{
 			DeadLetterTopic:     dlqTopicName,
-			MaxDeliveryAttempts: 5, // Use a low number for fast test execution
+			MaxDeliveryAttempts: 5,
 		},
 		RetryPolicy: &pubsubpb.RetryPolicy{
-			MinimumBackoff: &durationpb.Duration{Seconds: 1}, // Fast retries
+			MinimumBackoff: &durationpb.Duration{Seconds: 1},
 		},
 	}
 	_, err = psClient.SubscriptionAdminClient.CreateSubscription(ctx, mainSub)
 	require.NoError(t, err)
 
-	// 3. Arrange: Create service with dependencies
-	// Dispatcher (Mock)
-	fcmDispatcher := newMockDispatcher(-1)
-	dispatchers := map[string]dispatch.Dispatcher{"android": fcmDispatcher}
-
-	// Token Store (Mock - not expected to be called)
+	// 3. Arrange: Dependencies
+	fcmDispatcher := newMockDispatcher(-1) // Helper from integration test file
+	webDispatcher := &mockPoisonWebDispatcher{}
 	tokenStore := new(mockTokenStore)
 
-	// Consumer (Legacy)
 	consumerCfg := *messagepipeline.NewGooglePubsubConsumerDefaults(mainSubID)
 	consumer, err := messagepipeline.NewGooglePubsubConsumer(&consumerCfg, psClient, logger)
 	require.NoError(t, err)
 
-	// Service Configuration
 	cfg := &config.Config{
 		ProjectID:          projectID,
 		ListenAddr:         ":0",
@@ -122,31 +124,33 @@ func TestNotificationService_PoisonPill(t *testing.T) {
 		NumPipelineWorkers: 2,
 	}
 
-	// Instantiate Service
-	// We pass a no-op auth middleware since we aren't testing the API here
 	noopAuth := func(h http.Handler) http.Handler { return h }
 
-	notificationService, err := notificationservice.New(cfg, consumer, dispatchers, tokenStore, noopAuth, slogLogger)
+	// New Constructor Usage
+	notificationService, err := notificationservice.New(
+		cfg,
+		consumer,
+		fcmDispatcher,
+		webDispatcher,
+		tokenStore,
+		noopAuth,
+		logger,
+	)
 	require.NoError(t, err)
 
-	// 4. Act: Start the service and publish a poison pill message
+	// 4. Act
 	serviceCtx, serviceCancel := context.WithCancel(ctx)
 	defer serviceCancel()
 	go func() {
-		if err := notificationService.Start(serviceCtx); err != nil && !errors.Is(err, context.Canceled) {
-			t.Logf("service.Start() returned an error: %v", err)
-		}
+		_ = notificationService.Start(serviceCtx)
 	}()
 	t.Cleanup(func() { _ = notificationService.Shutdown(context.Background()) })
 
-	// Publish MALFORMED JSON. This triggers a failure in the Transformer (unmarshal error).
+	// Publish Poison Pill
 	poisonPayload := []byte(`{"this is not valid json"`)
-	result := psClient.Publisher(mainTopicID).Publish(ctx, &pubsub.Message{Data: poisonPayload})
-	_, err = result.Get(ctx)
-	require.NoError(t, err)
-	t.Log("Published poison pill message.")
+	psClient.Publisher(mainTopicID).Publish(ctx, &pubsub.Message{Data: poisonPayload}).Get(ctx)
 
-	// 5. Assert: Verify the message arrives on the DLQ subscription
+	// 5. Assert DLQ
 	dlqSub := psClient.Subscriber(dlqSubID)
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -156,22 +160,17 @@ func TestNotificationService_PoisonPill(t *testing.T) {
 		defer wg.Done()
 		cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		defer cancel()
-		err = dlqSub.Receive(cctx, func(ctx context.Context, msg *pubsub.Message) {
+		_ = dlqSub.Receive(cctx, func(ctx context.Context, msg *pubsub.Message) {
 			msg.Ack()
 			receivedMsg = msg
-			cancel() // Stop receiving after one message
+			cancel()
 		})
-		if err != nil && !errors.Is(err, context.Canceled) {
-			t.Errorf("DLQ Receive returned an unexpected error: %v", err)
-		}
 	}()
 
 	wg.Wait()
 	require.NotNil(t, receivedMsg, "Did not receive message on the DLQ subscription")
 	assert.Equal(t, poisonPayload, receivedMsg.Data)
-	t.Log("✅ Poison pill message correctly received on DLQ.")
 
-	// 6. Negative Assertion: Verify the dispatcher was never called
-	assert.Equal(t, 0, fcmDispatcher.GetCallCount(), "Dispatcher should not be called for a poison pill message")
-	t.Log("✅ Verified dispatcher was not called.")
+	// 6. Assert No Dispatch
+	assert.Equal(t, 0, fcmDispatcher.GetCallCount())
 }

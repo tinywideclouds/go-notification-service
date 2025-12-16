@@ -1,41 +1,77 @@
-# **go-notification-service**
+# Go Notification Service
 
-The **go-notification-service** is a dedicated, single-responsibility microservice for dispatching native push notifications to mobile platforms like iOS (APNS) and Android (FCM). It operates as a backend consumer, processing notification requests from a Google Cloud Pub/Sub topic.
+A dedicated microservice for handling multi-platform push notifications. This service acts as the "Muscle" in the backend architecture, responsible for the physical delivery of messages to user devices via Firebase Cloud Messaging (FCM).
 
-### **Architecture**
+## 🏗 Architecture
 
-The service is an asynchronous, event-driven pipeline built using components from the go-dataflow library. It contains no public API and is designed for high-throughput, resilient message processing.
+The Notification Service operates as an event-driven consumer in the platform's routing pipeline.
 
-**Core Workflow:**
 
-1. **Consume**: The service listens to a configured Pub/Sub subscription for incoming NotificationRequest messages.
-2. **Transform**: An initial pipeline step validates and unmarshals the raw message payload into a structured Go type.
-3. **Process & Route**: The core processor groups device tokens by platform (ios, android).
-4. **Dispatch**: The processor invokes the appropriate platform-specific Dispatcher (e.g., an APNS or FCM client) to send the notifications.
 
-### **Key Features**
+1.  **Event Driven:** Listens to Pub/Sub topics for "Notify User" commands.
+2.  **Decoupled:** It is the *sole owner* of device token storage. The Routing Service sends a user ID, and this service resolves it to actual device tokens (FCM/APNS).
+3.  **Platform Agnostic:** Supports dispatching to Web (PWA), Android, and iOS via a unified FCM adapter.
 
-* **Single Responsibility**: Focused exclusively on handling native mobile push notifications.
-* **Resilient by Design**: Built as a message processing pipeline that can be configured with Dead-Letter Queues (DLQs) to handle poison pill messages.
-* **Extensible**: Easily supports new platforms by adding a new component that implements the notification.Dispatcher interface.
-* **Horizontally Scalable**: As a stateless consumer, you can run multiple instances of the service to increase processing throughput.
+## 🚀 Features
 
-### **Configuration**
+* **Token Management:** REST API (`PUT /tokens`) for devices to register their FCM tokens.
+* **Smart Dispatch:** Looks up all active devices for a user and multicasts notifications.
+* **Scalable:** Deploys as a stateless container on Cloud Run; scales to zero when idle.
+* **Secure:** Uses Google Secret Manager for sensitive service account credentials.
 
-The service is configured via config.yaml for non-secret values and environment variables for secrets (like APNS/FCM keys).
+## 🔌 API Endpoints
 
-* project\_id: The Google Cloud project ID.
-* subscription\_id: The Pub/Sub subscription to pull notification requests from.
-* subscription\_dlq\_topic\_id: **(Required for Production)** The Dead-Letter Topic for the subscription.
-* num\_workers: The number of concurrent workers to process messages.
+### Register Device Token
+Used by the frontend (Angular PWA/Mobile) to link a device to the current user.
 
-### **Running the Service**
+* **URL:** `PUT /tokens`
+* **Auth:** Requires valid JWT (Bearer Token)
+* **Body:**
+    ```json
+    {
+      "token": "fcm-registration-token-from-browser",
+      "platform": "web"
+    }
+    ```
 
-1. **Configure config.yaml**.
-2. **Set Environment Variables** (for real dispatchers):  
-   \# Example for future implementation  
-   export APNS\_KEY\_ID="YOUR\_KEY\_ID"  
-   export FCM\_SERVER\_KEY="YOUR\_SERVER\_KEY"
+## 🛠 Setup & Configuration
 
-3. **Run the Service**:  
-   go run ./cmd/notificationservice  
+### Prerequisites
+* **Firebase Project:** A project set up in the Firebase Console to handle messaging.
+* **Service Account:** A `service-account.json` key file from Firebase with "Firebase Admin" permissions.
+
+### Environment Variables
+
+| Variable | Description | Example |
+| :--- | :--- | :--- |
+| `GCP_PROJECT_ID` | Google Cloud Project ID | `my-project-id` |
+| `IDENTITY_SERVICE_URL` | URL of the Identity Service (for JWT validation) | `https://identity-service.run.app` |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Path to the Firebase Service Account key | `/secrets/service-account.json` |
+| `LOG_LEVEL` | Logging verbosity | `info` / `debug` |
+
+### Local Development
+
+1.  **Place Key:** Drop your `service-account.json` in the project root (ensure it is `.gitignored`).
+2.  **Export Creds:**
+    ```bash
+    export GOOGLE_APPLICATION_CREDENTIALS="./service-account.json"
+    ```
+3.  **Run:**
+    ```bash
+    go run cmd/notificationservice/runnotificationservice.go
+    ```
+
+## 📦 Deployment (Cloud Run)
+
+This service is designed for Source-based deployment to Google Cloud Run.
+
+```bash
+gcloud run deploy notification-service \
+  --source . \
+  --region us-central1 \
+  --allow-unauthenticated \
+  --set-env-vars="GCP_PROJECT_ID=[YOUR_PROJECT_ID]" \
+  --set-env-vars="IDENTITY_SERVICE_URL=[YOUR_ID_URL]" \
+  --set-env-vars="GOOGLE_APPLICATION_CREDENTIALS=/secrets/service-account.json" \
+  --set-secrets="/secrets/service-account.json=fcm-service-account:latest"
+  ```

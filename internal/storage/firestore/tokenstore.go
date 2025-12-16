@@ -1,84 +1,136 @@
-// --- File: internal/storage/firestore/tokenstore.go ---
 package firestore
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
-	"log/slog"
+	"time"
 
 	"cloud.google.com/go/firestore"
-	"github.com/tinywideclouds/go-platform/pkg/net/v1"
+	"google.golang.org/api/iterator"
+
+	urn "github.com/tinywideclouds/go-platform/pkg/net/v1"
 	"github.com/tinywideclouds/go-platform/pkg/notification/v1"
 )
 
-// TokenDocument represents how we store tokens in Firestore.
-// Structure: collection/userURN/devices/tokenString
-type TokenDocument struct {
-	Token     string      `firestore:"token"`
-	Platform  string      `firestore:"platform"`
-	UpdatedAt interface{} `firestore:"updated_at"` // ServerTimestamp
+// FirestoreStore implements TokenStore using Google Cloud Firestore.
+type FirestoreStore struct {
+	client *firestore.Client
 }
 
-type TokenStore struct {
-	client     *firestore.Client
-	collection string
-	logger     *slog.Logger
+func NewFirestoreStore(client *firestore.Client) *FirestoreStore {
+	return &FirestoreStore{client: client}
 }
 
-func NewTokenStore(client *firestore.Client, collectionName string, logger *slog.Logger) *TokenStore {
-	return &TokenStore{
-		client:     client,
-		collection: collectionName,
-		logger:     logger.With("component", "TokenStore"),
-	}
+// deviceRecord is the internal DB representation.
+// It can hold EITHER a simple string OR a complex object.
+type deviceRecord struct {
+	Platform        string                            `firestore:"platform"`
+	Token           string                            `firestore:"token,omitempty"`            // Used for Android/iOS
+	WebSubscription *notification.WebPushSubscription `firestore:"web_subscription,omitempty"` // Used for Web
+	UpdatedAt       time.Time                         `firestore:"updated_at"`
 }
 
-func (s *TokenStore) RegisterToken(ctx context.Context, userURN urn.URN, token notification.DeviceToken) error {
-	// Path: /device-tokens/{userURN}/devices/{token}
-	// Using the token itself as the ID ensures easy deduplication.
-	docRef := s.client.Collection(s.collection).
-		Doc(userURN.String()).
-		Collection("devices").
-		Doc(token.Token) // Use token string as ID to prevent duplicates
+// --- DOOR A: FCM (Mobile) ---
 
-	_, err := docRef.Set(ctx, map[string]interface{}{
-		"token":      token.Token,
-		"platform":   token.Platform,
-		"updated_at": firestore.ServerTimestamp,
-	})
+func (s *FirestoreStore) RegisterFCM(ctx context.Context, user urn.URN, token string) error {
+	// Use hash of token as Doc ID to prevent duplicates and hot-spotting
+	docID := hashToken(token)
 
-	if err != nil {
-		s.logger.Error("Failed to register token", "err", err, "user", userURN.String())
-		return fmt.Errorf("failed to register token: %w", err)
+	record := deviceRecord{
+		Platform:  "fcm", // or "android"/"ios" passed in if you prefer specific tracking
+		Token:     token,
+		UpdatedAt: time.Now(),
 	}
 
-	s.logger.Info("Token registered successfully", "user", userURN.String(), "platform", token.Platform)
-	return nil
+	_, err := s.deviceRef(user, docID).Set(ctx, record)
+	return err
 }
 
-func (s *TokenStore) GetTokens(ctx context.Context, userURN urn.URN) ([]notification.DeviceToken, error) {
-	iter := s.client.Collection(s.collection).
-		Doc(userURN.String()).
-		Collection("devices").
-		Documents(ctx)
+func (s *FirestoreStore) UnregisterFCM(ctx context.Context, user urn.URN, token string) error {
+	docID := hashToken(token)
+	_, err := s.deviceRef(user, docID).Delete(ctx)
+	return err
+}
 
-	docs, err := iter.GetAll()
-	if err != nil {
-		s.logger.Error("Failed to fetch tokens", "err", err, "user", userURN.String())
-		return nil, fmt.Errorf("failed to fetch tokens: %w", err)
+// --- DOOR B: Web (VAPID) ---
+
+func (s *FirestoreStore) RegisterWeb(ctx context.Context, user urn.URN, sub notification.WebPushSubscription) error {
+	// For Web, the Endpoint URL is the unique identifier
+	docID := hashToken(sub.Endpoint)
+
+	record := deviceRecord{
+		Platform:        "web",
+		WebSubscription: &sub, // Store the full object
+		UpdatedAt:       time.Now(),
 	}
 
-	var results []notification.DeviceToken
-	for _, doc := range docs {
-		var data TokenDocument
-		if err := doc.DataTo(&data); err != nil {
-			continue // Skip malformed docs
+	_, err := s.deviceRef(user, docID).Set(ctx, record)
+	return err
+}
+
+func (s *FirestoreStore) UnregisterWeb(ctx context.Context, user urn.URN, endpoint string) error {
+	docID := hashToken(endpoint)
+	_, err := s.deviceRef(user, docID).Delete(ctx)
+	return err
+}
+
+// --- FAN-OUT (The Lookup) ---
+
+func (s *FirestoreStore) Fetch(ctx context.Context, user urn.URN) (*notification.NotificationRequest, error) {
+	// Query all devices for this user
+	iter := s.devicesCollection(user).Documents(ctx)
+	defer iter.Stop()
+
+	// Initialize the buckets
+	req := &notification.NotificationRequest{
+		RecipientID:      user,
+		FCMTokens:        make([]string, 0),
+		WebSubscriptions: make([]notification.WebPushSubscription, 0),
+	}
+
+	for {
+		doc, err := iter.Next()
+		if err == iterator.Done {
+			break
 		}
-		results = append(results, notification.DeviceToken{
-			Token:    data.Token,
-			Platform: data.Platform,
-		})
+		if err != nil {
+			return nil, fmt.Errorf("firestore iteration failed: %w", err)
+		}
+
+		var record deviceRecord
+		if err := doc.DataTo(&record); err != nil {
+			// Log and continue? Or fail? Usually safe to skip corrupt rows.
+			continue
+		}
+
+		// SORTING HAT LOGIC
+		if record.Platform == "web" && record.WebSubscription != nil {
+			// Bucket B: Web
+			req.WebSubscriptions = append(req.WebSubscriptions, *record.WebSubscription)
+		} else if record.Token != "" {
+			// Bucket A: Mobile (Default fallback)
+			req.FCMTokens = append(req.FCMTokens, record.Token)
+		}
 	}
 
-	return results, nil
+	return req, nil
+}
+
+// --- Helpers ---
+
+// deviceRef: users/{userID}/devices/{deviceHash}
+func (s *FirestoreStore) deviceRef(user urn.URN, docID string) *firestore.DocumentRef {
+	return s.devicesCollection(user).Doc(docID)
+}
+
+func (s *FirestoreStore) devicesCollection(user urn.URN) *firestore.CollectionRef {
+	// Assumes a root collection "users"
+	return s.client.Collection("users").Doc(user.String()).Collection("devices")
+}
+
+func hashToken(t string) string {
+	sum := sha256.Sum256([]byte(t))
+	return hex.EncodeToString(sum[:])
 }

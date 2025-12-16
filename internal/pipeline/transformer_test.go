@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tinywideclouds/go-notification-service/internal/pipeline"
-	"github.com/tinywideclouds/go-platform/pkg/net/v1"
+	urn "github.com/tinywideclouds/go-platform/pkg/net/v1"
 	"github.com/tinywideclouds/go-platform/pkg/notification/v1"
 )
 
@@ -21,7 +21,7 @@ func TestNotificationRequestTransformer(t *testing.T) {
 	t.Cleanup(cancel)
 
 	// Helper to create a native request
-	urnObj, _ := urn.Parse("urn:sm:user:user-123")
+	urnObj, _ := urn.Parse("urn:contacts:user:user-123")
 	validReq := &notification.NotificationRequest{
 		RecipientID: urnObj,
 		Content: notification.NotificationContent{

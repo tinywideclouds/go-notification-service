@@ -10,6 +10,12 @@ cors:
     - "http://localhost:5173" # Common for Vite
     - "http://localhost:8080" # Common for general dev servers
 
+vapid:
+  public_key: "BAE-OyH4wq6oJIulBi6d_DCA8djt9gbKR3az6zxkEQJJN5NA5zaCwiPjliGtrzgXfx70JC8_4NrQ-aUlqnpW0gY"  # The long string starting with B
+  private_key: "EZyZna1B4afNCKj8D0CXB9RTQKQn2yrVvMiaH6vcalY"   # The private key
+  subscriber_email: "tim@tinywideclouds.com" # Required by spec so services can contact you if you spam
+  
+topic_id: "push-notifications"
 subscription_id: "push-notifications-sub"
 subscription_dlq_topic_id: "push-notifications-dlq"
 

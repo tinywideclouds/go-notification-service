@@ -1,62 +1,165 @@
-// --- File: internal/api/token_api.go ---
 package api
 
 import (
 	"encoding/json"
-	"log/slog"
 	"net/http"
+
+	"log/slog"
 
 	"github.com/tinywideclouds/go-microservice-base/pkg/middleware"
 	"github.com/tinywideclouds/go-microservice-base/pkg/response"
 	"github.com/tinywideclouds/go-notification-service/pkg/dispatch"
-	"github.com/tinywideclouds/go-platform/pkg/net/v1"
+	urn "github.com/tinywideclouds/go-platform/pkg/net/v1"
 	"github.com/tinywideclouds/go-platform/pkg/notification/v1"
 )
 
-// TokenAPI handles device registration requests.
 type TokenAPI struct {
 	Store  dispatch.TokenStore
 	Logger *slog.Logger
 }
 
 func NewTokenAPI(store dispatch.TokenStore, logger *slog.Logger) *TokenAPI {
-	return &TokenAPI{Store: store, Logger: logger}
+	return &TokenAPI{
+		Store:  store,
+		Logger: logger,
+	}
 }
 
-// RegisterTokenHandler handles PUT /tokens
-// It extracts the user from the JWT and saves the token from the body.
-func (a *TokenAPI) RegisterTokenHandler(w http.ResponseWriter, r *http.Request) {
-	// 1. Auth check
-	userID, ok := middleware.GetUserIDFromContext(r.Context())
-	if !ok || userID == "" {
-		response.WriteJSONError(w, http.StatusUnauthorized, "missing user identity")
+// --- DOOR A: Mobile (FCM) ---
+
+type RegisterFCMRequest struct {
+	Token string `json:"token"`
+}
+
+func (api *TokenAPI) RegisterFCM(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	userID, ok := middleware.GetUserHandleFromContext(ctx)
+	if !ok {
+		response.WriteJSONError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	userURN, err := urn.Parse(userID)
-	if err != nil {
-		a.Logger.Warn("Invalid user URN in token", "user_id", userID)
-		response.WriteJSONError(w, http.StatusUnauthorized, "invalid user identity format")
+	userURN, _ := urn.Parse(userID)
+
+	var req RegisterFCMRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.WriteJSONError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
 
-	// 2. Decode body
-	var tokenReq notification.DeviceToken
-	if err := json.NewDecoder(r.Body).Decode(&tokenReq); err != nil {
-		response.WriteJSONError(w, http.StatusBadRequest, "invalid json body")
+	if req.Token == "" {
+		response.WriteJSONError(w, http.StatusBadRequest, "missing token")
 		return
 	}
 
-	if tokenReq.Token == "" || tokenReq.Platform == "" {
-		response.WriteJSONError(w, http.StatusBadRequest, "token and platform are required")
+	// Direct call to FCM storage logic
+	if err := api.Store.RegisterFCM(ctx, userURN, req.Token); err != nil {
+		api.Logger.Error("failed to register fcm", "err", err)
+		response.WriteJSONError(w, http.StatusInternalServerError, "storage failed")
 		return
 	}
 
-	// 3. Register
-	if err := a.Store.RegisterToken(r.Context(), userURN, tokenReq); err != nil {
-		a.Logger.Error("Failed to register token", "err", err)
-		response.WriteJSONError(w, http.StatusInternalServerError, "failed to register token")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- DOOR B: Web (VAPID) ---
+
+func (api *TokenAPI) RegisterWeb(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	userID, ok := middleware.GetUserHandleFromContext(ctx)
+	if !ok {
+		response.WriteJSONError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
+	userURN, _ := urn.Parse(userID)
+
+	// We decode directly into the Domain Object we defined in the previous step
+	var sub notification.WebPushSubscription
+	if err := json.NewDecoder(r.Body).Decode(&sub); err != nil {
+		api.Logger.Error("RegisterWeb: JSON Decode failed", "err", err)
+		response.WriteJSONError(w, http.StatusBadRequest, "invalid subscription json")
+		return
+	}
+
+	// Validate the Web Object (The "Big JSON" keys must exist)
+	if sub.Endpoint == "" || len(sub.Keys.P256dh) == 0 || len(sub.Keys.Auth) == 0 {
+		api.Logger.Warn("RegisterWeb: Validation failed", "reason", "missing fields")
+		response.WriteJSONError(w, http.StatusBadRequest, "incomplete subscription object")
+		return
+	}
+
+	// Direct call to Web storage logic
+	if err := api.Store.RegisterWeb(ctx, userURN, sub); err != nil {
+		api.Logger.Error("failed to register web", "err", err)
+		response.WriteJSONError(w, http.StatusInternalServerError, "storage failed")
+		return
+	}
+	api.Logger.Info("RegisterWeb: Subscription registered", "user", userURN, "endpoint", sub.Endpoint)
+
+	// Success
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (api *TokenAPI) UnregisterFCM(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	userID, ok := middleware.GetUserHandleFromContext(ctx)
+	if !ok {
+		response.WriteJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	userURN, _ := urn.Parse(userID)
+
+	var req RegisterFCMRequest // We can reuse the struct since it just holds "token"
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.WriteJSONError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+
+	if err := api.Store.UnregisterFCM(ctx, userURN, req.Token); err != nil {
+		// Log but don't fail hard; idempotency is preferred for unregister
+		api.Logger.Warn("failed to unregister fcm", "err", err)
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- UNREGISTER DOOR B: Web (VAPID) ---
+
+type UnregisterWebRequest struct {
+	Endpoint string `json:"endpoint"`
+}
+
+func (api *TokenAPI) UnregisterWeb(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	userID, ok := middleware.GetUserHandleFromContext(ctx)
+	if !ok {
+		response.WriteJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	userURN, _ := urn.Parse(userID)
+
+	var req UnregisterWebRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		api.Logger.Error("UnregisterWeb: JSON Decode failed", "err", err)
+		response.WriteJSONError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+
+	// We only need the Endpoint URL to identify and delete the row
+	if req.Endpoint == "" {
+		api.Logger.Warn("UnregisterWeb: Validation failed", "reason", "missing endpoint")
+		response.WriteJSONError(w, http.StatusBadRequest, "missing endpoint")
+		return
+	}
+
+	if err := api.Store.UnregisterWeb(ctx, userURN, req.Endpoint); err != nil {
+		api.Logger.Warn("failed to unregister web", "err", err)
+		response.WriteJSONError(w, http.StatusInternalServerError, "failed to unregister web")
+		return
+	}
+	api.Logger.Info("UnregisterWeb: Subscription unregistered", "user", userURN, "endpoint", req.Endpoint)
+
+	// Success
 
 	w.WriteHeader(http.StatusNoContent)
 }

@@ -12,7 +12,20 @@ import (
 	"github.com/tinywideclouds/go-microservice-base/pkg/middleware"
 )
 
-// Config defines the *single*, authoritative configuration for the Notification Service.
+type RedisConfig struct {
+	Enabled  bool
+	Addr     string
+	Password string
+	DB       int
+}
+
+type VapidConfig struct {
+	PublicKey       string
+	PrivateKey      string
+	SubscriberEmail string
+}
+
+// Config defines the *single*, authoritative configuration.
 type Config struct {
 	ProjectID              string
 	ListenAddr             string
@@ -21,13 +34,14 @@ type Config struct {
 	NumPipelineWorkers     int
 
 	CorsConfig middleware.CorsConfig
+	Redis      RedisConfig
+	Vapid      VapidConfig // ✅ Added
 
-	// PubsubConsumerConfig is derived from SubscriptionID
+	TopicID              string
 	PubsubConsumerConfig *messagepipeline.GooglePubsubConsumerConfig
 }
 
-// UpdateConfigWithEnvOverrides takes the base configuration (created from YAML)
-// and completes it by applying environment variables and final validation.
+// UpdateConfigWithEnvOverrides applies environment variables and final validation.
 func UpdateConfigWithEnvOverrides(cfg *Config, logger *slog.Logger) (*Config, error) {
 	logger.Debug("Applying environment variable overrides...")
 
@@ -43,7 +57,6 @@ func UpdateConfigWithEnvOverrides(cfg *Config, logger *slog.Logger) (*Config, er
 	if val := os.Getenv("SUBSCRIPTION_ID"); val != "" {
 		logger.Debug("Overriding config value", "key", "SUBSCRIPTION_ID", "source", "env")
 		cfg.SubscriptionID = val
-		// If subscription ID changes, we must regenerate the consumer config
 		cfg.PubsubConsumerConfig = messagepipeline.NewGooglePubsubConsumerDefaults(val)
 	}
 	if val := os.Getenv("SUBSCRIPTION_DLQ_TOPIC_ID"); val != "" {
@@ -57,9 +70,41 @@ func UpdateConfigWithEnvOverrides(cfg *Config, logger *slog.Logger) (*Config, er
 		}
 	}
 
+	// Redis Overrides
+	if val := os.Getenv("REDIS_ADDR"); val != "" {
+		cfg.Redis.Addr = val
+		cfg.Redis.Enabled = true
+	}
+	if val := os.Getenv("REDIS_PASSWORD"); val != "" {
+		cfg.Redis.Password = val
+	}
+	if val := os.Getenv("REDIS_DB"); val != "" {
+		if db, err := strconv.Atoi(val); err == nil {
+			cfg.Redis.DB = db
+		}
+	}
+	if val := os.Getenv("REDIS_ENABLED"); val != "" {
+		enabled, _ := strconv.ParseBool(val)
+		cfg.Redis.Enabled = enabled
+	}
+
+	// ✅ VAPID Overrides
+	if val := os.Getenv("VAPID_PUBLIC_KEY"); val != "" {
+		logger.Debug("Overriding config value", "key", "VAPID_PUBLIC_KEY", "source", "env")
+		cfg.Vapid.PublicKey = val
+	}
+	if val := os.Getenv("VAPID_PRIVATE_KEY"); val != "" {
+		logger.Debug("Overriding config value", "key", "VAPID_PRIVATE_KEY", "source", "env")
+		cfg.Vapid.PrivateKey = val
+	}
+	if val := os.Getenv("VAPID_SUB_EMAIL"); val != "" {
+		logger.Debug("Overriding config value", "key", "VAPID_SUB_EMAIL", "source", "env")
+		cfg.Vapid.SubscriberEmail = val
+	}
+
+	// CORS Overrides
 	if corsOrigins := os.Getenv("CORS_ALLOWED_ORIGINS"); corsOrigins != "" {
 		logger.Debug("Overriding config value", "key", "CORS_ALLOWED_ORIGINS", "source", "env")
-		// Split by comma and trim spaces
 		rawOrigins := strings.Split(corsOrigins, ",")
 		var cleanOrigins []string
 		for _, o := range rawOrigins {
@@ -78,13 +123,12 @@ func UpdateConfigWithEnvOverrides(cfg *Config, logger *slog.Logger) (*Config, er
 		return nil, fmt.Errorf("subscription_id is required (set via YAML or SUBSCRIPTION_ID env var)")
 	}
 	if cfg.ListenAddr == "" {
-		cfg.ListenAddr = ":8080" // Default fallback
+		cfg.ListenAddr = ":8080"
 	}
 	if cfg.NumPipelineWorkers <= 0 {
-		cfg.NumPipelineWorkers = 1 // Safe default
+		cfg.NumPipelineWorkers = 1
 	}
 
-	// 3. Ensure Consumer Config is present (if not set in YAML or Env, but ID exists)
 	if cfg.PubsubConsumerConfig == nil && cfg.SubscriptionID != "" {
 		cfg.PubsubConsumerConfig = messagepipeline.NewGooglePubsubConsumerDefaults(cfg.SubscriptionID)
 	}

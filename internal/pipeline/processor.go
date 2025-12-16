@@ -1,4 +1,3 @@
-// --- File: internal/pipeline/processor.go ---
 package pipeline
 
 import (
@@ -10,11 +9,12 @@ import (
 	"github.com/tinywideclouds/go-platform/pkg/notification/v1"
 )
 
-// NewProcessor creates the main message handler.
-// REFACTORED: Now accepts TokenStore to look up recipients.
+// NewProcessor creates the logic that handles the "Fan-Out".
+// We inject specific dispatchers because the interfaces are now different (Strings vs Objects).
 func NewProcessor(
-	dispatchers map[string]dispatch.Dispatcher,
-	tokenStore dispatch.TokenStore, // <-- ADDED
+	fcmDispatcher dispatch.Dispatcher, // Handles []string (Mobile)
+	webDispatcher dispatch.WebDispatcher, // Handles []WebPushSubscription (Web)
+	tokenStore dispatch.TokenStore,
 	logger *slog.Logger,
 ) messagepipeline.StreamProcessor[notification.NotificationRequest] {
 
@@ -24,40 +24,59 @@ func NewProcessor(
 			"pubsub_msg_id", original.ID,
 		)
 
-		// 1. Fetch Tokens (The new responsibility)
-		// The request coming from Routing Service NO LONGER has tokens.
-		// We must find them.
-		tokens, err := tokenStore.GetTokens(ctx, request.RecipientID)
+		// 1. Fetch & Fan-Out (The Lookup)
+		// We re-fetch the request data from the store to populate the token buckets.
+		// The incoming 'request' has the Content, but the Store has the Tokens.
+		enrichedReq, err := tokenStore.Fetch(ctx, request.RecipientID)
 		if err != nil {
 			procLogger.Error("Failed to fetch device tokens", "err", err)
-			return err // Retryable error
+			return err
 		}
 
-		if len(tokens) == 0 {
-			procLogger.Info("No devices registered for user; dropping notification.")
-			return nil
-		}
+		// 2. Path A: FCM (Mobile)
+		if len(enrichedReq.FCMTokens) > 0 {
+			receipt, invalidTokens, err := fcmDispatcher.Dispatch(ctx, enrichedReq.FCMTokens, request.Content, request.DataPayload)
 
-		// 2. Group tokens by platform (Logic preserved)
-		tokensByPlatform := make(map[string][]string)
-		for _, token := range tokens {
-			tokensByPlatform[token.Platform] = append(tokensByPlatform[token.Platform], token.Token)
-		}
-
-		// 3. Dispatch
-		for platform, platformTokens := range tokensByPlatform {
-			dispatcher, ok := dispatchers[platform]
-			if !ok {
-				procLogger.Warn("No dispatcher configured for platform", "platform", platform)
-				continue
+			// Self-Healing (Strings)
+			if len(invalidTokens) > 0 {
+				procLogger.Info("Cleaning up invalid FCM tokens", "count", len(invalidTokens))
+				for _, t := range invalidTokens {
+					if err := tokenStore.UnregisterFCM(ctx, request.RecipientID, t); err != nil {
+						procLogger.Warn("Failed to delete FCM token", "token", t, "err", err)
+					}
+				}
 			}
 
-			procLogger.Info("Dispatching notification", "platform", platform, "count", len(platformTokens))
-			err := dispatcher.Dispatch(ctx, platformTokens, request.Content, request.DataPayload)
 			if err != nil {
-				procLogger.Error("Dispatcher failed", "err", err, "platform", platform)
-				return err
+				procLogger.Error("FCM Dispatch failed", "err", err)
+				return err // Retryable
 			}
+			procLogger.Info("FCM Dispatched", "receipt", receipt)
+		}
+
+		// 3. Path B: Web (VAPID)
+		if len(enrichedReq.WebSubscriptions) > 0 {
+			receipt, invalidSubs, err := webDispatcher.Dispatch(ctx, enrichedReq.WebSubscriptions, request.Content, request.DataPayload)
+
+			// Self-Healing (Objects - clean up by Endpoint)
+			if len(invalidSubs) > 0 {
+				procLogger.Info("Cleaning up invalid Web subscriptions", "count", len(invalidSubs))
+				for _, sub := range invalidSubs {
+					if err := tokenStore.UnregisterWeb(ctx, request.RecipientID, sub.Endpoint); err != nil {
+						procLogger.Warn("Failed to delete Web subscription", "endpoint", sub.Endpoint, "err", err)
+					}
+				}
+			}
+
+			if err != nil {
+				procLogger.Error("Web Dispatch failed", "err", err)
+				return err // Retryable
+			}
+			procLogger.Info("Web Dispatched", "receipt", receipt)
+		}
+
+		if len(enrichedReq.FCMTokens) == 0 && len(enrichedReq.WebSubscriptions) == 0 {
+			procLogger.Info("No devices registered for user; dropping notification.")
 		}
 
 		return nil
